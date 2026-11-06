@@ -1,0 +1,7 @@
+project_id = "jrrclxiqiohdcyiqlzwt"
+
+[functions.annotate]
+verify_jwt = true
+
+[functions.define]
+verify_jwt = true

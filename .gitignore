@@ -1,1 +1,12 @@
+.env
 .env.local
+.env.*.local
+node_modules/
+dist/
+.DS_Store
+*.zip
+.supabase/
+supabase/.temp/
+extension/config.local.js
+extension/manifest.key.txt
+extension/extension_id.txt
