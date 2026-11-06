@@ -3,8 +3,25 @@
   const DONE = "data-pt-done";
   const SELECTORS = "p, h1, h2, h3, h4, h5, h6, li, blockquote";
   const BATCH = 6;
+  // First request of a scan is small so the first words show up sooner
+  // (output length drives model latency). Later requests use BATCH.
+  const FIRST_BATCH = 3;
   const CONCURRENCY = 3;
+  // Only paragraphs on screen or within about one screen of it get requested.
+  const PREFETCH_MARGIN = "100% 0px 100% 0px";
+  // Coalesce bursts of DOM mutations into one scan.
+  const SCAN_DEBOUNCE_MS = 150;
+  // Collect paragraphs that become visible close together into one request.
+  const INTERSECT_COALESCE_MS = 80;
+  const OWN_NODE_SELECTOR = ".pt-gloss, .pt-highlight, .pt-banner";
   const queue = [];
+  // Elements already handed to the IntersectionObserver
+  let observed = new WeakSet();
+  // Elements currently inside the viewport + prefetch margin
+  const nearViewport = new Set();
+  let io = null;
+  let scanTimer = null;
+  let sentFirstBatch = false;
   const inflight = new Set();
   let settings = { active: false, levelIndex: 4 };
   let signedIn = false;
@@ -51,14 +68,13 @@
   function collectTargets() {
     return [...document.querySelectorAll(SELECTORS)].filter((el) => {
       if (el.closest(".pt-gloss, .pt-banner")) return false;
-      if (el.hasAttribute(DONE) || inflight.has(el)) return false;
+      if (observed.has(el) || el.hasAttribute(DONE) || inflight.has(el)) return false;
       if (el.closest("[contenteditable='true'], button, textarea, select")) return false;
       if (isSiteChrome(el)) return false;
       if (el.querySelector(SELECTORS)) return false;
       if (isLinkListItem(el)) return false;
       const text = (el.innerText || "").trim();
       if (text.length < 12) return false;
-      if (!isVisible(el)) return false;
       return true;
     });
   }
@@ -93,14 +109,85 @@
     }, ms);
   }
 
-  function enqueueVisible() {
+  function ensureIO() {
+    if (io) return io;
+    io = new IntersectionObserver(onIntersect, { rootMargin: PREFETCH_MARGIN });
+    return io;
+  }
+
+  function onIntersect(entries) {
+    let added = false;
+    for (const entry of entries) {
+      const el = entry.target;
+      if (entry.isIntersecting) {
+        nearViewport.add(el);
+        if (el.hasAttribute(DONE) || inflight.has(el) || queue.includes(el)) continue;
+        if (!isVisible(el)) continue;
+        if (!el.hasAttribute(ATTR)) el.setAttribute(ATTR, uid());
+        queue.push(el);
+        added = true;
+      } else {
+        nearViewport.delete(el);
+        // Scrolled far away before its turn: drop it, it re-queues on return.
+        const i = queue.indexOf(el);
+        if (i >= 0) queue.splice(i, 1);
+      }
+    }
+    if (added) {
+      queue.sort((a, b) => priority(a) - priority(b));
+      // Short wait so paragraphs entering one by one while scrolling share a
+      // request instead of each paying for the fixed prompt. The prefetch
+      // margin is a full screen, so the wait is not visible.
+      schedulePump(INTERSECT_COALESCE_MS);
+    }
+  }
+
+  // Finds new candidate paragraphs and hands them to the IntersectionObserver.
+  // Requests happen only from onIntersect, i.e. for paragraphs near the screen.
+  function scanTargets() {
     if (!settings.active || !signedIn || quotaBlocked) return;
+    const observer = ensureIO();
     for (const el of collectTargets()) {
+      observed.add(el);
+      observer.observe(el);
+    }
+  }
+
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
+      scanTargets();
+    }, SCAN_DEBOUNCE_MS);
+  }
+
+  // Requeue paragraphs that are near the screen but not done (after an error
+  // pause, quota reset, or re-scan).
+  function requeueNearViewport() {
+    for (const el of nearViewport) {
+      if (!document.contains(el)) {
+        nearViewport.delete(el);
+        continue;
+      }
+      if (el.hasAttribute(DONE) || inflight.has(el) || queue.includes(el)) continue;
       if (!el.hasAttribute(ATTR)) el.setAttribute(ATTR, uid());
-      if (!queue.includes(el)) queue.push(el);
+      queue.push(el);
     }
     queue.sort((a, b) => priority(a) - priority(b));
     pump();
+  }
+
+  // A mutation is "ours" when it adds/removes our gloss/highlight/banner
+  // elements and no other elements. Text nodes are ignored when deciding,
+  // because highlighting splits text nodes around each <mark>.
+  function isOwnMutation(m) {
+    if (m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest?.(OWN_NODE_SELECTOR)) {
+      return true;
+    }
+    const elements = [...m.addedNodes, ...m.removedNodes].filter(
+      (n) => n.nodeType === Node.ELEMENT_NODE,
+    );
+    return elements.length > 0 && elements.every((n) => n.matches?.(OWN_NODE_SELECTOR));
   }
 
   function termsForBatch(results, batch) {
@@ -114,8 +201,9 @@
   }
 
   function takeBatch() {
+    const size = sentFirstBatch ? BATCH : FIRST_BATCH;
     const batch = [];
-    while (batch.length < BATCH && queue.length) {
+    while (batch.length < size && queue.length) {
       const el = queue.shift();
       if (!el || inflight.has(el) || !document.contains(el) || el.hasAttribute(DONE)) continue;
       batch.push(el);
@@ -132,6 +220,7 @@
     while (inFlightCount < CONCURRENCY) {
       const batch = takeBatch();
       if (!batch.length) return;
+      sentFirstBatch = true;
       inFlightCount += 1;
       const gen = scanGen;
       for (const el of batch) {
@@ -192,7 +281,12 @@
       inFlightCount -= 1;
       if (gen === scanGen && retryBatch) {
         for (const el of batch) {
-          if (document.contains(el) && !el.hasAttribute(DONE) && !queue.includes(el)) {
+          if (
+            document.contains(el) &&
+            nearViewport.has(el) &&
+            !el.hasAttribute(DONE) &&
+            !queue.includes(el)
+          ) {
             queue.unshift(el);
           }
         }
@@ -335,15 +429,18 @@
 
   function startObserver() {
     if (observer) return;
-    observer = new MutationObserver(() => {
+    observer = new MutationObserver((mutations) => {
       if (!settings.active) return;
-      enqueueVisible();
+      // Our own gloss/highlight insertions should not trigger a page rescan.
+      if (mutations.every(isOwnMutation)) return;
+      scheduleScan();
     });
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
     });
-    window.addEventListener("scroll", enqueueVisible, { passive: true });
+    // No scroll listener: the IntersectionObserver reports paragraphs as they
+    // come near the screen.
   }
 
   function stopObserver() {
@@ -351,9 +448,20 @@
       observer.disconnect();
       observer = null;
     }
-    window.removeEventListener("scroll", enqueueVisible);
+    if (scanTimer) {
+      clearTimeout(scanTimer);
+      scanTimer = null;
+    }
+    resetIO();
     queue.length = 0;
     hideBanner();
+  }
+
+  function resetIO() {
+    io?.disconnect();
+    io = null;
+    observed = new WeakSet();
+    nearViewport.clear();
   }
 
   function clearAnnotations() {
@@ -387,10 +495,13 @@
           pauseUntil = 0;
           scanGen += 1;
           queue.length = 0;
+          sentFirstBatch = false;
           clearAnnotations();
+          resetIO();
         }
         startObserver();
-        enqueueVisible();
+        scanTargets();
+        requeueNearViewport();
       } else {
         stopObserver();
         if (wasActive) clearAnnotations();
@@ -411,7 +522,7 @@
     if (settings.active && signedIn) {
       clearAnnotations();
       startObserver();
-      enqueueVisible();
+      scanTargets();
     }
   });
 })();
