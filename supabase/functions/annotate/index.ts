@@ -4,6 +4,11 @@ import { geminiJson } from "../_shared/gemini.ts";
 
 const MAX_BATCH = 8;
 const MAX_CHARS = 2500;
+// Upper bound on terms the model is asked for per paragraph. Output tokens
+// dominate latency, so this is a speed/coverage knob (was 8).
+const MAX_TERMS_ASKED = 6;
+// Bump when the prompt or output format changes (shows up in logs).
+const PROMPT_VERSION = "compact-v1";
 
 function foldWithMap(paragraph: string): { folded: string; map: number[] } {
   let folded = "";
@@ -54,15 +59,21 @@ function resultList(parsed: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(parsed)) return parsed as Array<Record<string, unknown>>;
   if (!parsed || typeof parsed !== "object") return [];
   const obj = parsed as Record<string, unknown>;
-  for (const key of ["results", "paragraphs", "annotations", "items"]) {
+  for (const key of ["r", "results", "paragraphs", "annotations", "items"]) {
     if (Array.isArray(obj[key])) return obj[key] as Array<Record<string, unknown>>;
   }
   return [];
 }
 
-function termFields(term: Record<string, unknown>) {
-  const surface = term.surface ?? term.word ?? term.term ?? term.phrase ?? term.text ?? "";
-  const meaning = term.meaning ?? term.gloss ?? term.translation ?? term.korean ?? term.definition ?? "";
+function termFields(term: unknown) {
+  // Compact format: ["surface", "meaning"]
+  if (Array.isArray(term)) {
+    return { surface: String(term[0] ?? ""), meaning: String(term[1] ?? "") };
+  }
+  if (!term || typeof term !== "object") return { surface: "", meaning: "" };
+  const t = term as Record<string, unknown>;
+  const surface = t.s ?? t.surface ?? t.word ?? t.term ?? t.phrase ?? t.text ?? "";
+  const meaning = t.m ?? t.meaning ?? t.gloss ?? t.translation ?? t.korean ?? t.definition ?? "";
   return { surface: String(surface), meaning: String(meaning) };
 }
 
@@ -100,37 +111,48 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Compact I/O: the model sees paragraphs by index and answers with
+    // [surface, meaning] pairs. Ids never go through the model; the server maps
+    // index -> id. Fewer output tokens = faster responses.
+    const indexed = cleaned.map((p: { text: string }, i: number) => ({ i, text: p.text }));
     const prompt = `You help Korean learners read English web pages.
 Learner CEFR level: ${level}.
-For EACH paragraph, pick 2 to 8 words or short phrases that are likely difficult or nuanced for that level.
-Prefer content words (nouns, verbs, adjectives, adverbs, idioms). Skip the most basic function words.
-Even for C1/C2, still pick subtle/academic/rare items if present. Only use [] when the paragraph is extremely simple.
-Meaning must be short contextual Korean for THIS paragraph (not a long dictionary entry).
-Return JSON only, with one results item per paragraph, in the same order.
-Copy each paragraph "id" exactly. Do not invent or abbreviate ids.
-{"results":[{"id":"<the paragraph id>","terms":[{"surface":"exact substring copied from the paragraph","meaning":"짧은 한국어 뜻"}]}]}
-surface MUST be copied exactly from the paragraph text (same spelling and casing).
+For EACH paragraph, pick 2 to ${MAX_TERMS_ASKED} words or short phrases that are likely difficult or nuanced for that level.
+Prefer content words (nouns, verbs, adjectives, adverbs, idioms). Skip basic function words.
+Even for C1/C2, still pick subtle/academic/rare items if present. Use [] only when the paragraph is extremely simple.
+Meaning: short contextual Korean for THIS paragraph, not a dictionary entry.
+Return JSON only, one item per paragraph, using the paragraph's "i":
+{"r":[{"i":0,"t":[["exact substring from the paragraph","짧은 한국어 뜻"]]}]}
+The first element of each pair MUST be copied exactly from the paragraph text.
 
 Paragraphs:
-${JSON.stringify(cleaned)}`;
+${JSON.stringify(indexed)}`;
 
-    const parsed = await geminiJson(prompt);
+    const parsed = await geminiJson(prompt, `annotate:${PROMPT_VERSION}:n=${cleaned.length}`);
     const list = resultList(parsed);
-    const idMatches = list.filter((r) => cleaned.some((p: { id: string }) => String(r.id) === p.id)).length;
-    const useIndex = idMatches === 0 && list.length > 0;
+    const byIndex = new Map<number, Record<string, unknown>>();
+    for (const r of list) {
+      const i = Number(r?.i ?? r?.index);
+      if (Number.isInteger(i) && !byIndex.has(i)) byIndex.set(i, r);
+    }
+    // Legacy/drifted output that still echoes ids
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const r of list) if (r?.id != null) byId.set(String(r.id), r);
+    // Positional fallback only when the model gave neither index nor id
+    const usePosition = byIndex.size === 0 && byId.size === 0 && list.length === cleaned.length;
 
     const results = cleaned.map((p: { id: string; text: string }, index: number) => {
-      const hit = useIndex
-        ? list[index]
-        : list.find((r) => String(r.id) === p.id);
-      const rawTerms = Array.isArray(hit?.terms)
+      const hit = byIndex.get(index) ?? byId.get(p.id) ?? (usePosition ? list[index] : undefined);
+      const rawTerms = Array.isArray(hit?.t)
+        ? hit.t
+        : Array.isArray(hit?.terms)
         ? hit.terms
         : Array.isArray(hit?.words)
         ? hit.words
         : [];
-      const terms = (rawTerms as Array<Record<string, unknown>>)
+      const terms = (rawTerms as unknown[])
         .map((t) => {
-          const fields = termFields(t || {});
+          const fields = termFields(t);
           const surface = alignSurface(p.text, fields.surface);
           const meaning = fields.meaning.trim();
           if (!surface || !meaning) return null;
@@ -141,7 +163,10 @@ ${JSON.stringify(cleaned)}`;
       return { id: p.id, terms };
     });
 
-    const totalTerms = results.reduce((sum, r) => sum + r.terms.length, 0);
+    const totalTerms = results.reduce(
+      (sum: number, r: { terms: unknown[] }) => sum + r.terms.length,
+      0,
+    );
     if (totalTerms === 0) {
       console.warn(
         "annotate produced no terms",

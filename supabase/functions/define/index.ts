@@ -36,7 +36,7 @@ Return JSON only: {"surface":"${selection.replace(/"/g, '\\"')}","meaning":"í•œê
 Selection: ${selection}
 Paragraph: ${text}`;
 
-    const parsed = await geminiJson(prompt) as { surface?: string; meaning?: string };
+    const parsed = await geminiJson(prompt, "define") as { surface?: string; meaning?: string };
     return jsonResponse({
       surface: parsed.surface || selection,
       meaning: parsed.meaning || "",
