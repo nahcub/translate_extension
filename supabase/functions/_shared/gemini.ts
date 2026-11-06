@@ -49,14 +49,21 @@ export async function geminiJson(prompt: string, label = "gemini"): Promise<unkn
     `?key=${encodeURIComponent(key)}`;
 
   const started = Date.now();
-  let res = await callGemini(url, prompt, thinkingLevel);
+  // Use the level this call was sent with, not the shared variable: parallel
+  // requests all start with the preferred level, and the first one to get a
+  // 400 flips the shared value before the others see their own 400.
+  let level = thinkingLevel;
+  let res = await callGemini(url, prompt, level);
 
-  if (!res.ok && res.status === 400 && thinkingLevel !== FALLBACK_THINKING) {
+  if (!res.ok && res.status === 400 && level !== FALLBACK_THINKING) {
     const text = await res.text();
     if (/thinking/i.test(text)) {
-      console.warn(`thinkingLevel "${thinkingLevel}" rejected, falling back to "${FALLBACK_THINKING}"`);
+      if (thinkingLevel !== FALLBACK_THINKING) {
+        console.warn(`thinkingLevel "${level}" rejected, falling back to "${FALLBACK_THINKING}"`);
+      }
       thinkingLevel = FALLBACK_THINKING;
-      res = await callGemini(url, prompt, thinkingLevel);
+      level = FALLBACK_THINKING;
+      res = await callGemini(url, prompt, level);
     } else {
       throw new Error(`Gemini error ${res.status}: ${text.slice(0, 400)}`);
     }
@@ -76,7 +83,7 @@ export async function geminiJson(prompt: string, label = "gemini"): Promise<unkn
     metric: "gemini_call",
     label,
     model: MODEL,
-    thinkingLevel,
+    thinkingLevel: level,
     ms: Date.now() - started,
     promptTokens: usage.promptTokenCount ?? null,
     outputTokens: usage.candidatesTokenCount ?? null,
